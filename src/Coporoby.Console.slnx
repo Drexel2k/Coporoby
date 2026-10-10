@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Coporoby.Cli/Coporoby.Cli.csproj" />
+  <Project Path="Coporoby.Core/Coporoby.Core.csproj" />
+</Solution>

@@ -1,2 +1,2 @@
 # Coporoby
-A file sync tool.
+A fast and flexible sync tool for local files.
