@@ -1,6 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.IO.Enumeration;
-using System.Threading.Channels;
+using System.Runtime.ExceptionServices;
 
 namespace Coporoby.Core
 {
@@ -8,85 +8,142 @@ namespace Coporoby.Core
     {
         private readonly string _sourceDirectory;
         private readonly string _targetDirectory;
-        private readonly int _concurrentScanners;
+        private readonly int _concurrentComparers;
         private readonly TimeSpan _fileModifiedTolerance;
 
-        private readonly Channel<DirectoryWorkItem> _directoryChannel = Channel.CreateUnbounded<DirectoryWorkItem>();
-        private readonly ConcurrentBag<FileSystemChange> _fileSystemChanges = new();
-        private int _directoriesPending;   // directories queued OR currently being processed
+        // Directories still to compare. Consumed by the source comparing threads.
+        private readonly BlockingCollection<DirectoryWorkItem> _sourceDirectoryQueue = [];
+        // Directory listings requested by source comparing threads (used for the concurrent target listing)
+        private readonly BlockingCollection<DirectoryListRequest> _targetDirectoryQueue = [];
+        private readonly ConcurrentBag<FileSystemChange> _fileSystemChanges = [];
+        private readonly TaskCompletionSource<IReadOnlyCollection<FileSystemChange>> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private int _sourceDirectoriesPending;   // directories queued or currently being processed
+        private int _activeSourceComparing;       // source listing threads still running
+        private int _started;              // an instance can only run once
 
         private static readonly EnumerationOptions enumerationOptions = new()
         {
-            IgnoreInaccessible = true,
+            IgnoreInaccessible = false,
             AttributesToSkip = FileAttributes.ReparsePoint,   // don't follow symlinks/junctions
             RecurseSubdirectories = false,
             BufferSize = 64 * 1024                             // fewer round trips on file systems / network shares
         };
 
-        public DirectoryComparerThreaded(string source, string target, int concurrentScanners, TimeSpan? fileModifiedTolerance)
+        public DirectoryComparerThreaded(string source, string target, int concurrentComparers, TimeSpan? fileModifiedTolerance)
         {
-            ArgumentOutOfRangeException.ThrowIfLessThan(concurrentScanners, 1);
+            ArgumentOutOfRangeException.ThrowIfLessThan(concurrentComparers, 1);
             _sourceDirectory = Path.GetFullPath(source);
             _targetDirectory = Path.GetFullPath(target);
-            _concurrentScanners = concurrentScanners;
+            _concurrentComparers = concurrentComparers;
             _fileModifiedTolerance = fileModifiedTolerance ?? TimeSpan.Zero;
         }
 
         public async Task<IReadOnlyCollection<FileSystemChange>> RunAsync(CancellationToken cancellationToken = default)
         {
+            if (Interlocked.Exchange(ref _started, 1) != 0)
+                throw new InvalidOperationException("This comparer instance has already been run.");
+
             if (!Directory.Exists(_sourceDirectory))
                 throw new DirectoryNotFoundException($"Source not found: {_sourceDirectory}");
 
             if (!Directory.Exists(_targetDirectory))
                 throw new DirectoryNotFoundException($"Target not found or not reachable: {_targetDirectory}");
 
-            // Source listing blocks on synchronous I/O (and each may use one more thread for the
-            // concurrent target listing, therefore _consumerCount * 2), so let the pool grow
-            // immediately instead of slowly. + 4 as buffer for other workl in the process.
-            ThreadPool.GetMinThreads(out int minWorker, out int minIo);
-            int minNeededWorker = _concurrentScanners * 2 + 4;
-            if (minWorker < minNeededWorker)
-                ThreadPool.SetMinThreads(minNeededWorker, minIo);
+            EnqueueSourceDirectoryCompare(new DirectoryWorkItem(string.Empty, true));   // root = empty relative path
 
-            EnqueuDirectoryScan(new DirectoryWorkItem(string.Empty, true));   // root = empty relative path
+            // Dedicated threads for listing source and target directories
+            // We use thread and not taks here, because in the library we don't want to use the thread pool
+            _activeSourceComparing = _concurrentComparers;
 
-            Task[] tasks = Enumerable.Range(0, _concurrentScanners)
-                .Select(_ => Task.Run(() => DequeueDirectoryScanAsync(cancellationToken), cancellationToken))
-                .ToArray();
-            await Task.WhenAll(tasks);
+            for (int i = 0; i < _concurrentComparers; i++)
+                StartThread($"TargetLister-{i}", DequeueTargetDirectoryList);
 
-            return _fileSystemChanges.ToArray();
+            for (int i = 0; i < _concurrentComparers; i++)
+                StartThread($"SourceLister-{i}", () => DequeueSourceDirectoryCompare(cancellationToken));
+
+            return await _completion.Task.ConfigureAwait(false);
         }
 
-        private void EnqueuDirectoryScan(DirectoryWorkItem workItem)
+        private static void StartThread(string name, ThreadStart body)
         {
-            Interlocked.Increment(ref _directoriesPending);   // count before writing so it can't hit 0 early
-            if (!_directoryChannel.Writer.TryWrite(workItem))
+            new Thread(body) { IsBackground = true, Name = name }.Start();
+        }
+
+        private void EnqueueSourceDirectoryCompare(DirectoryWorkItem workItem)
+        {
+            Interlocked.Increment(ref _sourceDirectoriesPending);   // increment before adding so it can't hit 0 early
+            _sourceDirectoryQueue.Add(workItem);
+        }
+
+        private void DequeueSourceDirectoryCompare(CancellationToken cancellationToken)
+        {
+            try
             {
-                throw new InvalidOperationException("Adding directory to queue failed.");
+                foreach (DirectoryWorkItem workItem in _sourceDirectoryQueue.GetConsumingEnumerable(cancellationToken))
+                {
+                    try
+                    {
+                        CompareDirectory(workItem, cancellationToken);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        // Todo: Log / output
+                    }
+                    finally
+                    {
+                        // Subdirectories were enqueued (and counted) in CompareDirectory already
+                        if (Interlocked.Decrement(ref _sourceDirectoriesPending) == 0)
+                        {
+                            _sourceDirectoryQueue.CompleteAdding();
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Reported via Finish() through the token.
+            }
+            catch (Exception ex)
+            {
+                _completion.TrySetException(ex);
+            }
+            finally
+            {
+                if (Interlocked.Decrement(ref _activeSourceComparing) == 0)
+                {
+                    Finish(cancellationToken);
+                }
             }
         }
 
-        private async Task DequeueDirectoryScanAsync(CancellationToken cancellationToken)
+        // Called by the last comparer thread to exit.
+        private void Finish(CancellationToken cancellationToken)
         {
-            await foreach (DirectoryWorkItem workItem in _directoryChannel.Reader.ReadAllAsync(cancellationToken))
+            _targetDirectoryQueue.CompleteAdding();   // lets the target listing threads exit
+
+            if (cancellationToken.IsCancellationRequested)
+                _completion.TrySetCanceled(cancellationToken);
+            else
+                _completion.TrySetResult(_fileSystemChanges.ToArray());
+        }
+
+        private void DequeueTargetDirectoryList()
+        {
+            foreach (DirectoryListRequest request in _targetDirectoryQueue.GetConsumingEnumerable())
             {
                 try
                 {
-                    CompareDirectory(workItem, cancellationToken);
+                    request.Result = ListDirectory(request.Path);
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException)
+                catch (Exception ex)
                 {
-                    // Todo: Logger / output instead.
-                    Console.WriteLine($"Error in '{workItem.RelativeDir}': {ex.Message}");
+                    request.Error = ExceptionDispatchInfo.Capture(ex);
                 }
                 finally
                 {
-                    // Subdirectories were enqueued (and counted) in CompareDirectory already
-                    if (Interlocked.Decrement(ref _directoriesPending) == 0)
-                    {
-                        _directoryChannel.Writer.TryComplete();
-                    }
+                    request.Done.Set();
                 }
             }
         }
@@ -96,21 +153,54 @@ namespace Coporoby.Core
             string sourcePath = Path.Combine(_sourceDirectory, workItem.RelativeDir);
             string targetPath = Path.Combine(_targetDirectory, workItem.RelativeDir);
 
-            // One enumeration per side, but on target only when it exists. Source and target are listed concurrently.
-            Task<Dictionary<string, FileSystemObject>>? targetTask = workItem.TargetExists
-                ? Task.Run(() => ListDirectory(targetPath), cancellationToken)
-                : null;
+            // One enumeration per side, but on target only when it exists.
+            // Target is listed on a listing thread while this thread lists the source.
+            DirectoryListRequest? targetRequest = null;
+            if (workItem.TargetExists)
+            {
+                targetRequest = new DirectoryListRequest(targetPath);
+                _targetDirectoryQueue.Add(targetRequest, cancellationToken);
+            }
 
-            Dictionary<string, FileSystemObject> sourceEntries = ListDirectory(sourcePath);
-            Dictionary<string, FileSystemObject> targetEntries = targetTask is null
-                ? new Dictionary<string, FileSystemObject>(StringComparer.OrdinalIgnoreCase)
-                : targetTask.GetAwaiter().GetResult();
+            Dictionary<string, FileSystemObject> sourceEntries;
+            Dictionary<string, FileSystemObject> targetEntries;
+
+            try
+            {
+                sourceEntries = ListDirectory(sourcePath);
+            }
+            catch (Exception)
+            {
+                // Todo: Log / output
+                return;
+            }
+
+            bool targetListed = true;
+            try
+            {
+                targetEntries = targetRequest is null ? [] : targetRequest.Wait(cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                targetEntries = [];
+                targetListed = false;
+                // Todo: Log / output
+            }
 
             // 1. Check everything in source directory for matches in target directory.
             foreach ((string name, FileSystemObject sourceEntry) in sourceEntries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 string relativePath = Path.Combine(workItem.RelativeDir, name);
+
+                if (!targetListed)
+                {
+                    // Target state unknown: report nothing here, but keep descending.
+                    // TargetExists = true, so the child tries its own target listing.
+                    if (sourceEntry.IsDirectory)
+                        EnqueueSourceDirectoryCompare(new DirectoryWorkItem(relativePath, true));
+                    continue;
+                }
 
                 // Same name and same kind on the other side?
                 bool hasMatch = targetEntries.TryGetValue(name, out FileSystemObject? targetEntry) && targetEntry.IsDirectory == sourceEntry.IsDirectory;
@@ -124,7 +214,7 @@ namespace Coporoby.Core
 
                     // Always descend: for a new directory this lists its content as New files/dirs.
                     // If the target directory is missing, the children never touch the target.
-                    EnqueuDirectoryScan(new DirectoryWorkItem(relativePath, hasMatch));
+                    EnqueueSourceDirectoryCompare(new DirectoryWorkItem(relativePath, hasMatch));
                     continue;
                 }
 
@@ -132,7 +222,7 @@ namespace Coporoby.Core
                 if (!hasMatch)
                 {
                     _fileSystemChanges.Add(new FileSystemChange(ChangeType.Create, relativePath,
-                        $"(source modified {sourceEntry.LastWriteUtc:u})", false));
+                        $"(source new {sourceEntry.LastWriteUtc:u})", false));
                     continue;
                 }
 
@@ -151,8 +241,11 @@ namespace Coporoby.Core
                 }
             }
 
+            if (!targetListed)
+                return;
+
             // 2. Check everything in target directory for no matches in source directory.
-            //    A directory not in source but in target is reported ONCE and not descended into
+            //    A directory not in source but in target is reported once and not descended into
             //    (it is never enqueued), so its content is not reported file by file.
             foreach ((string name, FileSystemObject targetEntry) in targetEntries)
             {
@@ -179,10 +272,9 @@ namespace Coporoby.Core
         }
 
         // One enumeration returns files and directories together.
-        // Case-insensitive like Windows/SMB
         private static Dictionary<string, FileSystemObject> ListDirectory(string path)
         {
-            Dictionary<string, FileSystemObject> result = new Dictionary<string, FileSystemObject>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, FileSystemObject> result = [];
 
             foreach ((string name, FileSystemObject entry) in new FileSystemEnumerable<(string Name, FileSystemObject)>(path,
                 (ref FileSystemEntry e) => (
@@ -191,7 +283,6 @@ namespace Coporoby.Core
                 enumerationOptions))
 
                 result[name] = entry;
-
 
             return result;
         }
